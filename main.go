@@ -166,13 +166,17 @@ func getData(ctx context.Context, filter map[string]string, nametag string) ([]*
 	t := time.Now()
 	u := t.Unix()
 
+	logrus.Debugf("getData called")
+
 	mu.Lock()
 	if !t.After(globalCache.Date.Add(opts.TTL)) {
 		// Cache hit
+		logrus.Debugf("getData cache hit")
 		mu.Unlock()
 		return globalCache.Metrics, nil
 	}
 	mu.Unlock()
+	logrus.Debugf("getData cache miss")
 
 	svc := autoscaling.New(session.New())
 	input := &autoscaling.DescribeAutoScalingGroupsInput{}
@@ -205,11 +209,13 @@ func getData(ctx context.Context, filter map[string]string, nametag string) ([]*
 			}
 			return true
 		}); err != nil {
+		logrus.Warnf("DescribeAutoScalingGroups failed: %v", err)
 		return nil, err
 	}
 
 	asg, err := convertASGsToMetrics(asgs, &u)
 	if err != nil {
+		logrus.Warnf("convertASGsToMetrics failed: %v", err)
 		return nil, err
 	}
 	mu.Lock()
