@@ -27,7 +27,7 @@ const (
 
 type ops struct {
 	LogLevel string `long:"log-level" env:"LOG_LEVEL" description:"Log level" default:"info"`
-	BindAddr string `long:"bind-address" short:"p" env:"BIND_ADDRESS" default:":9560" description:"address for binding metrics listener"`
+	BindAddr string `long:"bind-address" short:"p" env:"BIND_ADDRESS" default:":9655" description:"address for binding metrics listener"`
 
 	TTL     time.Duration `long:"ttl" env:"TTL" default:"30s" description:"TTL for local cache"`
 	Filter  string        `long:"filter" env:"FILTER" description:"comma separated map (e.g. k1=v1,k2=v2)"`
