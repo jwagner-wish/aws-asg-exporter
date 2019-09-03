@@ -113,7 +113,7 @@ func convertGroup(g *autoscaling.Group) (*asg, error) {
 	return a, nil
 }
 
-func convertASGsToMetrics(asgs []*asg, timestampMs *int64) ([]*dto.MetricFamily, error) {
+func convertASGsToMetrics(asgs []*asg) ([]*dto.MetricFamily, error) {
 	out := []*dto.MetricFamily{}
 	generateGaugeFamily := func(name, help string) *dto.MetricFamily {
 		g := dto.MetricType_GAUGE
@@ -135,9 +135,8 @@ func convertASGsToMetrics(asgs []*asg, timestampMs *int64) ([]*dto.MetricFamily,
 		generateMetric := func(v float64) *dto.Metric {
 			lp := &dto.LabelPair{Name: aws.String("name"), Value: aws.String(asg.Name)}
 			return &dto.Metric{
-				Label:       []*dto.LabelPair{lp},
-				TimestampMs: timestampMs,
-				Gauge:       &dto.Gauge{Value: &v},
+				Label: []*dto.LabelPair{lp},
+				Gauge: &dto.Gauge{Value: &v},
 			}
 		}
 
@@ -164,7 +163,6 @@ func convertASGsToMetrics(asgs []*asg, timestampMs *int64) ([]*dto.MetricFamily,
 
 func getData(ctx context.Context, filter map[string]string, nametag string) ([]*dto.MetricFamily, error) {
 	t := time.Now()
-	u := t.Unix()
 
 	logrus.Debugf("getData called")
 
@@ -213,7 +211,7 @@ func getData(ctx context.Context, filter map[string]string, nametag string) ([]*
 		return nil, err
 	}
 
-	asg, err := convertASGsToMetrics(asgs, &u)
+	asg, err := convertASGsToMetrics(asgs)
 	if err != nil {
 		logrus.Warnf("convertASGsToMetrics failed: %v", err)
 		return nil, err
