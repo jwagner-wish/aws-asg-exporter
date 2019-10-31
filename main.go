@@ -13,10 +13,12 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
+	"github.com/aws/aws-sdk-go/service/ec2"
 	flags "github.com/jessevdk/go-flags"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/sirupsen/logrus"
+	"github.com/wish/aws-asg-exporter/pkg/k8sNode"
 )
 
 const (
@@ -35,10 +37,18 @@ type ops struct {
 }
 
 var (
-	opts        *ops
-	globalCache *cache
-	mu          *sync.Mutex
+	opts           *ops
+	globalCache    *cache
+	mu             *sync.Mutex
+	nodeController *k8sNode.Controller
 )
+
+type instance struct {
+	ID            string
+	Name          string
+	LaunchTime    time.Time
+	JoinedK8sTime time.Time
+}
 
 type asg struct {
 	Name            string
@@ -46,14 +56,14 @@ type asg struct {
 	MaxSize         int64
 	MinSize         int64
 	Tags            map[string]string
-
-	Instances      int
-	InstanceStatus map[string]int
+	InstanceIds     []string
+	InstanceStatus  map[string]int
 }
 
 type cache struct {
-	Date    time.Time
-	Metrics []*dto.MetricFamily
+	Date      time.Time
+	Instances map[string]instance
+	Metrics   []*dto.MetricFamily
 }
 
 func main() {
@@ -82,6 +92,16 @@ func main() {
 		FullTimestamp: true,
 	}
 	logrus.SetFormatter(formatter)
+
+	newC, err := k8sNode.NewController()
+	if err != nil {
+		logrus.Fatalf("Could not create node watcher: %v", err)
+	}
+	nodeController = newC
+	stopCh := make(chan struct{})
+	defer close(stopCh)
+	nodeController.Run(stopCh)
+
 	http.HandleFunc("/", handler)
 	http.HandleFunc("/healthcheck", handler)
 	http.HandleFunc("/metrics", metricsHandler)
@@ -95,7 +115,7 @@ func convertGroup(g *autoscaling.Group) (*asg, error) {
 		DesiredCapacity: *g.DesiredCapacity,
 		MaxSize:         *g.MaxSize,
 		MinSize:         *g.MinSize,
-		Instances:       len(g.Instances),
+		InstanceIds:     make([]string, 0),
 		Tags:            make(map[string]string),
 		InstanceStatus:  make(map[string]int),
 	}
@@ -109,11 +129,12 @@ func convertGroup(g *autoscaling.Group) (*asg, error) {
 		} else {
 			a.InstanceStatus[*inst.HealthStatus] = v + 1
 		}
+		a.InstanceIds = append(a.InstanceIds, *inst.InstanceId)
 	}
 	return a, nil
 }
 
-func convertASGsToMetrics(asgs []*asg) ([]*dto.MetricFamily, error) {
+func convertASGsToMetrics(t time.Time, asgs []*asg, instances map[string]instance) ([]*dto.MetricFamily, error) {
 	out := []*dto.MetricFamily{}
 	generateGaugeFamily := func(name, help string) *dto.MetricFamily {
 		g := dto.MetricType_GAUGE
@@ -128,8 +149,10 @@ func convertASGsToMetrics(asgs []*asg) ([]*dto.MetricFamily, error) {
 	minFamily := generateGaugeFamily("aws_asg_min_size", "ASG minimum size")
 	maxFamily := generateGaugeFamily("aws_asg_max_size", "ASG maximum size")
 	desiredFamily := generateGaugeFamily("aws_asg_desired_capacity", "ASG desired capacity")
-	instances := generateGaugeFamily("aws_asg_instances", "ASG number of instances")
+	instancesFamily := generateGaugeFamily("aws_asg_instances", "ASG number of instances")
 	instanceStatus := generateGaugeFamily("aws_asg_instance_status", "ASG number of instances by status")
+	oldestUnbootstrappedFamily := generateGaugeFamily("aws_asg_oldest_unbootstrapped_instance_age_seconds", "The age in seconds of the oldest instance in the ASG not yet in the cluster")
+	numUnbootstrappedFamily := generateGaugeFamily("aws_asg_num_unbootstrapped_instances", "The number of instances in the ASG that have not joined the cluster")
 
 	for _, asg := range asgs {
 		generateMetric := func(v float64) *dto.Metric {
@@ -140,10 +163,26 @@ func convertASGsToMetrics(asgs []*asg) ([]*dto.MetricFamily, error) {
 			}
 		}
 
+		oldestUnbootstrappedSeconds := 0.0
+		numUnbootstrapped := 0
+		for _, i := range asg.InstanceIds {
+			if inst, ok := instances[i]; ok {
+				if inst.JoinedK8sTime.IsZero() {
+					numUnbootstrapped++
+					secondsSinceStart := float64((t.Sub(inst.LaunchTime)) / time.Second)
+					if secondsSinceStart > oldestUnbootstrappedSeconds {
+						oldestUnbootstrappedSeconds = secondsSinceStart
+					}
+				}
+			}
+		}
+
 		minFamily.Metric = append(minFamily.Metric, generateMetric(float64(asg.MinSize)))
 		maxFamily.Metric = append(maxFamily.Metric, generateMetric(float64(asg.MaxSize)))
 		desiredFamily.Metric = append(desiredFamily.Metric, generateMetric(float64(asg.DesiredCapacity)))
-		instances.Metric = append(instances.Metric, generateMetric(float64(asg.Instances)))
+		instancesFamily.Metric = append(instancesFamily.Metric, generateMetric(float64(len(asg.InstanceIds))))
+		oldestUnbootstrappedFamily.Metric = append(oldestUnbootstrappedFamily.Metric, generateMetric(float64(oldestUnbootstrappedSeconds)))
+		numUnbootstrappedFamily.Metric = append(numUnbootstrappedFamily.Metric, generateMetric(float64(numUnbootstrapped)))
 
 		for k, v := range asg.InstanceStatus {
 			m := generateMetric(float64(v))
@@ -156,8 +195,10 @@ func convertASGsToMetrics(asgs []*asg) ([]*dto.MetricFamily, error) {
 	out = append(out, minFamily)
 	out = append(out, maxFamily)
 	out = append(out, desiredFamily)
-	out = append(out, instances)
+	out = append(out, instancesFamily)
 	out = append(out, instanceStatus)
+	out = append(out, oldestUnbootstrappedFamily)
+	out = append(out, numUnbootstrappedFamily)
 	return out, nil
 }
 
@@ -211,18 +252,88 @@ func getData(ctx context.Context, filter map[string]string, nametag string) ([]*
 		return nil, err
 	}
 
-	asg, err := convertASGsToMetrics(asgs)
+	instanceIds := []string{}
+	for _, asg := range asgs {
+		instanceIds = append(instanceIds, asg.InstanceIds...)
+	}
+	instances, err := getInstances(ctx, instanceIds)
+	if err != nil {
+		logrus.Warnf("Failed to fetch instance details: %v", err)
+		return nil, err
+	}
+
+	asg, err := convertASGsToMetrics(t, asgs, instances)
 	if err != nil {
 		logrus.Warnf("convertASGsToMetrics failed: %v", err)
 		return nil, err
 	}
 	mu.Lock()
 	globalCache = &cache{
-		Date:    t,
-		Metrics: asg,
+		Date:      t,
+		Metrics:   asg,
+		Instances: instances,
 	}
 	mu.Unlock()
-	return asg, nil
+	return asg, err
+}
+
+func getInstances(ctx context.Context, instanceIds []string) (map[string]instance, error) {
+	instances := map[string]instance{}
+
+	mu.Lock()
+	unknownInstances := []*string{}
+	for _, ID := range instanceIds {
+		i := ID
+		instance, ok := globalCache.Instances[i]
+		if !ok {
+			unknownInstances = append(unknownInstances, &i)
+		} else {
+			instances[i] = instance
+		}
+	}
+	mu.Unlock()
+
+	svc := ec2.New(session.New())
+	input := &ec2.DescribeInstancesInput{
+		InstanceIds: unknownInstances,
+	}
+	if len(unknownInstances) > 0 {
+		err := svc.DescribeInstancesPagesWithContext(ctx, input, func(page *ec2.DescribeInstancesOutput, lastPage bool) bool {
+			mu.Lock()
+			defer mu.Unlock()
+			for _, reservation := range page.Reservations {
+				for _, i := range reservation.Instances {
+					if i.LaunchTime != nil && i.InstanceId != nil && i.PrivateDnsName != nil {
+						instances[*i.InstanceId] = instance{
+							ID:         *i.InstanceId,
+							Name:       *i.PrivateDnsName,
+							LaunchTime: *i.LaunchTime,
+						}
+					}
+				}
+			}
+			return true
+		})
+		if err != nil {
+			return instances, err
+		}
+	}
+
+	for i := range instances {
+		if instances[i].JoinedK8sTime.IsZero() {
+			n, err := nodeController.NodeByName(instances[i].Name)
+			if err != nil {
+				return instances, err
+			}
+			if n != nil {
+				inst := instances[i]
+				inst.JoinedK8sTime = n.CreationTimestamp.Time
+				instances[i] = inst
+			}
+		}
+	}
+
+	return instances, nil
 }
 
 func metricsHandler(rsp http.ResponseWriter, req *http.Request) {
