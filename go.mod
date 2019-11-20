@@ -3,7 +3,8 @@ module github.com/wish/aws-asg-exporter
 go 1.12
 
 require (
-	github.com/aws/aws-sdk-go v1.23.10
+	github.com/aws/aws-sdk-go v1.25.38
+	github.com/davecgh/go-spew v1.1.1
 	github.com/golang/protobuf v1.3.1 // indirect
 	github.com/jessevdk/go-flags v1.4.0
 	github.com/matttproud/golang_protobuf_extensions v1.0.1 // indirect

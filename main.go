@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/client"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/autoscaling"
 	flags "github.com/jessevdk/go-flags"
@@ -38,6 +39,7 @@ var (
 	opts        *ops
 	globalCache *cache
 	mu          *sync.Mutex
+	errorCounts map[string]int
 )
 
 type asg struct {
@@ -56,10 +58,54 @@ type cache struct {
 	Metrics []*dto.MetricFamily
 }
 
+func loopUpdateCache() {
+	filter := map[string]string{}
+	for _, item := range strings.Split(opts.Filter, ",") {
+		if !strings.Contains(item, "=") {
+			continue
+		} else {
+			spl := strings.Split(item, "=")
+			filter[spl[0]] = spl[1]
+		}
+	}
+
+	svc := autoscaling.New(session.New())
+	svc.Client.Retryer = client.DefaultRetryer{
+		NumMaxRetries:    9,
+		MinRetryDelay:    1 * time.Second,
+		MinThrottleDelay: 1 * time.Second,
+	}
+
+	for {
+		t := time.Now()
+		data, err := getData(context.Background(), filter, opts.NameTag, svc)
+		logrus.Debugf("Got data in %v seconds", float64(time.Now().Sub(t))/float64(time.Second))
+
+		mu.Lock()
+		if err != nil {
+			logrus.Errorf("Error fetching data: %v", err)
+			if _, ok := errorCounts[err.Error()]; !ok {
+				errorCounts[err.Error()] = 1
+			} else {
+				errorCounts[err.Error()]++
+			}
+		}
+		globalCache = &cache{
+			Date:    t,
+			Metrics: data,
+		}
+		mu.Unlock()
+
+		time.Sleep(opts.TTL - (time.Now().Sub(t)) - 5*time.Second)
+	}
+
+}
+
 func main() {
 	opts = &ops{}
 	globalCache = &cache{Date: time.Unix(0, 0)}
 	mu = &sync.Mutex{}
+	errorCounts = map[string]int{}
 	parser := flags.NewParser(opts, flags.Default)
 	if _, err := parser.Parse(); err != nil {
 		// If the error was from the parser, then we can simply return
@@ -82,6 +128,8 @@ func main() {
 		FullTimestamp: true,
 	}
 	logrus.SetFormatter(formatter)
+
+	go loopUpdateCache()
 	http.HandleFunc("/", handler)
 	http.HandleFunc("/healthcheck", handler)
 	http.HandleFunc("/metrics", metricsHandler)
@@ -161,26 +209,15 @@ func convertASGsToMetrics(asgs []*asg) ([]*dto.MetricFamily, error) {
 	return out, nil
 }
 
-func getData(ctx context.Context, filter map[string]string, nametag string) ([]*dto.MetricFamily, error) {
-	t := time.Now()
-
+func getData(ctx context.Context, filter map[string]string, nametag string, svc *autoscaling.AutoScaling) ([]*dto.MetricFamily, error) {
 	logrus.Debugf("getData called")
 
-	mu.Lock()
-	if !t.After(globalCache.Date.Add(opts.TTL)) {
-		// Cache hit
-		logrus.Debugf("getData cache hit")
-		mu.Unlock()
-		return globalCache.Metrics, nil
-	}
-	mu.Unlock()
-	logrus.Debugf("getData cache miss")
-
-	svc := autoscaling.New(session.New())
 	input := &autoscaling.DescribeAutoScalingGroupsInput{}
 	asgs := []*asg{}
+	logrus.Debugf("beginning request")
 	if err := svc.DescribeAutoScalingGroupsPagesWithContext(ctx, input,
 		func(page *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
+			logrus.Debugf("got page")
 		loop:
 			for _, group := range page.AutoScalingGroups {
 				a, err := convertGroup(group)
@@ -216,30 +253,59 @@ func getData(ctx context.Context, filter map[string]string, nametag string) ([]*
 		logrus.Warnf("convertASGsToMetrics failed: %v", err)
 		return nil, err
 	}
-	mu.Lock()
-	globalCache = &cache{
-		Date:    t,
-		Metrics: asg,
-	}
-	mu.Unlock()
 	return asg, nil
 }
 
-func metricsHandler(rsp http.ResponseWriter, req *http.Request) {
-	filter := map[string]string{}
-	for _, item := range strings.Split(opts.Filter, ",") {
-		if !strings.Contains(item, "=") {
-			continue
-		} else {
-			spl := strings.Split(item, "=")
-			filter[spl[0]] = spl[1]
+func errorCountMetrics(counts map[string]int) *dto.MetricFamily {
+	generateGaugeFamily := func(name, help string) *dto.MetricFamily {
+		c := dto.MetricType_COUNTER
+		return &dto.MetricFamily{
+			Name:   aws.String(name),
+			Help:   aws.String(help),
+			Type:   &c,
+			Metric: []*dto.Metric{},
 		}
 	}
 
-	out, err := getData(req.Context(), filter, opts.NameTag)
-	if err != nil {
-		logrus.Warnf("Could not get ASG data: %v", err)
+	errFamily := generateGaugeFamily("aws_asg_request_error_count", "Total number of errors in fetching data")
+
+	for msg, count := range counts {
+		generateMetric := func(v float64) *dto.Metric {
+			lp := &dto.LabelPair{Name: aws.String("error"), Value: aws.String(msg)}
+			return &dto.Metric{
+				Label:   []*dto.LabelPair{lp},
+				Counter: &dto.Counter{Value: &v},
+			}
+		}
+
+		errFamily.Metric = append(errFamily.Metric, generateMetric(float64(count)))
 	}
+
+	if len(errFamily.Metric) == 0 {
+		return nil
+	}
+
+	return errFamily
+}
+
+func metricsHandler(rsp http.ResponseWriter, req *http.Request) {
+
+	mu.Lock()
+	out := globalCache.Metrics
+	if out == nil {
+		out = make([]*dto.MetricFamily, 0)
+	}
+	errFamily := errorCountMetrics(errorCounts)
+	if errFamily != nil {
+		out = append(out, errFamily)
+	}
+	if time.Now().Sub(globalCache.Date) > opts.TTL {
+		// Only serve stale data once. After that we delete it
+		logrus.Warnf("The metrics cache has expired. No asg metrics will be reported until it is refreshed")
+		globalCache.Metrics = make([]*dto.MetricFamily, 0)
+	}
+	mu.Unlock()
+
 	contentType := expfmt.Negotiate(req.Header)
 	header := rsp.Header()
 	header.Set(contentTypeHeader, string(contentType))
