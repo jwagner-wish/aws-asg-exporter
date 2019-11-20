@@ -91,7 +91,7 @@ func loopUpdateCache() {
 			}
 		}
 		globalCache = &cache{
-			Date:    t,
+			Date:    time.Now(),
 			Metrics: data,
 		}
 		mu.Unlock()
