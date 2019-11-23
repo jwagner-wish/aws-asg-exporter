@@ -1,19 +1,12 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
-	"strings"
-	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go/aws"
-	"github.com/aws/aws-sdk-go/aws/client"
-	"github.com/aws/aws-sdk-go/aws/session"
-	"github.com/aws/aws-sdk-go/service/autoscaling"
 	flags "github.com/jessevdk/go-flags"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
@@ -27,85 +20,19 @@ const (
 )
 
 type ops struct {
-	LogLevel string `long:"log-level" env:"LOG_LEVEL" description:"Log level" default:"info"`
-	BindAddr string `long:"bind-address" short:"p" env:"BIND_ADDRESS" default:":9655" description:"address for binding metrics listener"`
-
-	TTL     time.Duration `long:"ttl" env:"TTL" default:"30s" description:"TTL for local cache"`
-	Filter  string        `long:"filter" env:"FILTER" description:"comma separated map (e.g. k1=v1,k2=v2)"`
-	NameTag string        `long:"name-tag" env:"NAME_TAG" description:"override name using given tag"`
+	AWSOps
+	LogLevel string        `long:"log-level" env:"LOG_LEVEL" description:"Log level" default:"info"`
+	BindAddr string        `long:"bind-address" short:"p" env:"BIND_ADDRESS" default:":9655" description:"address for binding metrics listener"`
+	TTL      time.Duration `long:"ttl" env:"TTL" default:"30s" description:"TTL for local cache"`
 }
 
 var (
-	opts        *ops
-	globalCache *cache
-	mu          *sync.Mutex
-	errorCounts map[string]int
+	opts           *ops
+	clientInstance *AWSClient
 )
-
-type asg struct {
-	Name            string
-	DesiredCapacity int64
-	MaxSize         int64
-	MinSize         int64
-	Tags            map[string]string
-
-	Instances      int
-	InstanceStatus map[string]int
-}
-
-type cache struct {
-	Date    time.Time
-	Metrics []*dto.MetricFamily
-}
-
-func loopUpdateCache() {
-	filter := map[string]string{}
-	for _, item := range strings.Split(opts.Filter, ",") {
-		if !strings.Contains(item, "=") {
-			continue
-		} else {
-			spl := strings.Split(item, "=")
-			filter[spl[0]] = spl[1]
-		}
-	}
-
-	svc := autoscaling.New(session.New())
-	svc.Client.Retryer = client.DefaultRetryer{
-		NumMaxRetries:    9,
-		MinRetryDelay:    1 * time.Second,
-		MinThrottleDelay: 1 * time.Second,
-	}
-
-	for {
-		t := time.Now()
-		data, err := getData(context.Background(), filter, opts.NameTag, svc)
-		logrus.Debugf("Got data in %v seconds", float64(time.Now().Sub(t))/float64(time.Second))
-
-		mu.Lock()
-		if err != nil {
-			logrus.Errorf("Error fetching data: %v", err)
-			if _, ok := errorCounts[err.Error()]; !ok {
-				errorCounts[err.Error()] = 1
-			} else {
-				errorCounts[err.Error()]++
-			}
-		}
-		globalCache = &cache{
-			Date:    time.Now(),
-			Metrics: data,
-		}
-		mu.Unlock()
-
-		time.Sleep(opts.TTL - (time.Now().Sub(t)) - 5*time.Second)
-	}
-
-}
 
 func main() {
 	opts = &ops{}
-	globalCache = &cache{Date: time.Unix(0, 0)}
-	mu = &sync.Mutex{}
-	errorCounts = map[string]int{}
 	parser := flags.NewParser(opts, flags.Default)
 	if _, err := parser.Parse(); err != nil {
 		// If the error was from the parser, then we can simply return
@@ -129,7 +56,10 @@ func main() {
 	}
 	logrus.SetFormatter(formatter)
 
-	go loopUpdateCache()
+	// Initialize the awsClient and start polling
+	clientInstance = NewClient(&opts.AWSOps)
+	go clientInstance.Run(opts.TTL - 5*time.Second)
+
 	http.HandleFunc("/", handler)
 	http.HandleFunc("/healthcheck", handler)
 	http.HandleFunc("/metrics", metricsHandler)
@@ -137,174 +67,20 @@ func main() {
 	logrus.Fatal(http.ListenAndServe(opts.BindAddr, nil))
 }
 
-func convertGroup(g *autoscaling.Group) (*asg, error) {
-	a := &asg{
-		Name:            *g.AutoScalingGroupName,
-		DesiredCapacity: *g.DesiredCapacity,
-		MaxSize:         *g.MaxSize,
-		MinSize:         *g.MinSize,
-		Instances:       len(g.Instances),
-		Tags:            make(map[string]string),
-		InstanceStatus:  make(map[string]int),
-	}
-	for _, tag := range g.Tags {
-		a.Tags[*tag.Key] = *tag.Value
-	}
-	for _, inst := range g.Instances {
-		v, ok := a.InstanceStatus[*inst.HealthStatus]
-		if !ok {
-			a.InstanceStatus[*inst.HealthStatus] = 1
-		} else {
-			a.InstanceStatus[*inst.HealthStatus] = v + 1
-		}
-	}
-	return a, nil
-}
-
-func convertASGsToMetrics(asgs []*asg) ([]*dto.MetricFamily, error) {
-	out := []*dto.MetricFamily{}
-	generateGaugeFamily := func(name, help string) *dto.MetricFamily {
-		g := dto.MetricType_GAUGE
-		return &dto.MetricFamily{
-			Name:   aws.String(name),
-			Help:   aws.String(help),
-			Type:   &g,
-			Metric: []*dto.Metric{},
-		}
-	}
-
-	minFamily := generateGaugeFamily("aws_asg_min_size", "ASG minimum size")
-	maxFamily := generateGaugeFamily("aws_asg_max_size", "ASG maximum size")
-	desiredFamily := generateGaugeFamily("aws_asg_desired_capacity", "ASG desired capacity")
-	instances := generateGaugeFamily("aws_asg_instances", "ASG number of instances")
-	instanceStatus := generateGaugeFamily("aws_asg_instance_status", "ASG number of instances by status")
-
-	for _, asg := range asgs {
-		generateMetric := func(v float64) *dto.Metric {
-			lp := &dto.LabelPair{Name: aws.String("name"), Value: aws.String(asg.Name)}
-			return &dto.Metric{
-				Label: []*dto.LabelPair{lp},
-				Gauge: &dto.Gauge{Value: &v},
-			}
-		}
-
-		minFamily.Metric = append(minFamily.Metric, generateMetric(float64(asg.MinSize)))
-		maxFamily.Metric = append(maxFamily.Metric, generateMetric(float64(asg.MaxSize)))
-		desiredFamily.Metric = append(desiredFamily.Metric, generateMetric(float64(asg.DesiredCapacity)))
-		instances.Metric = append(instances.Metric, generateMetric(float64(asg.Instances)))
-
-		for k, v := range asg.InstanceStatus {
-			m := generateMetric(float64(v))
-			lp := &dto.LabelPair{Name: aws.String("health_status"), Value: aws.String(k)}
-			m.Label = append(m.Label, lp)
-			instanceStatus.Metric = append(instanceStatus.Metric, m)
-		}
-	}
-
-	out = append(out, minFamily)
-	out = append(out, maxFamily)
-	out = append(out, desiredFamily)
-	out = append(out, instances)
-	out = append(out, instanceStatus)
-	return out, nil
-}
-
-func getData(ctx context.Context, filter map[string]string, nametag string, svc *autoscaling.AutoScaling) ([]*dto.MetricFamily, error) {
-	logrus.Debugf("getData called")
-
-	input := &autoscaling.DescribeAutoScalingGroupsInput{}
-	asgs := []*asg{}
-	logrus.Debugf("beginning request")
-	if err := svc.DescribeAutoScalingGroupsPagesWithContext(ctx, input,
-		func(page *autoscaling.DescribeAutoScalingGroupsOutput, lastPage bool) bool {
-			logrus.Debugf("got page")
-		loop:
-			for _, group := range page.AutoScalingGroups {
-				a, err := convertGroup(group)
-				if err != nil {
-					logrus.Warnf("Could not generate ASG: %v", err)
-					return false
-				}
-				for fk, fv := range filter {
-					tagv, ok := a.Tags[fk]
-					if !ok {
-						continue loop
-					}
-					if tagv != fv {
-						continue loop
-					}
-				}
-				if nametag != "" {
-					v, ok := a.Tags[nametag]
-					if ok {
-						a.Name = v
-					}
-				}
-				asgs = append(asgs, a)
-			}
-			return true
-		}); err != nil {
-		logrus.Warnf("DescribeAutoScalingGroups failed: %v", err)
-		return nil, err
-	}
-
-	asg, err := convertASGsToMetrics(asgs)
-	if err != nil {
-		logrus.Warnf("convertASGsToMetrics failed: %v", err)
-		return nil, err
-	}
-	return asg, nil
-}
-
-func errorCountMetrics(counts map[string]int) *dto.MetricFamily {
-	generateGaugeFamily := func(name, help string) *dto.MetricFamily {
-		c := dto.MetricType_COUNTER
-		return &dto.MetricFamily{
-			Name:   aws.String(name),
-			Help:   aws.String(help),
-			Type:   &c,
-			Metric: []*dto.Metric{},
-		}
-	}
-
-	errFamily := generateGaugeFamily("aws_asg_request_error_count", "Total number of errors in fetching data")
-
-	for msg, count := range counts {
-		generateMetric := func(v float64) *dto.Metric {
-			lp := &dto.LabelPair{Name: aws.String("error"), Value: aws.String(msg)}
-			return &dto.Metric{
-				Label:   []*dto.LabelPair{lp},
-				Counter: &dto.Counter{Value: &v},
-			}
-		}
-
-		errFamily.Metric = append(errFamily.Metric, generateMetric(float64(count)))
-	}
-
-	if len(errFamily.Metric) == 0 {
-		return nil
-	}
-
-	return errFamily
-}
-
 func metricsHandler(rsp http.ResponseWriter, req *http.Request) {
+	awsGroups, errors := clientInstance.GetMetrics()
 
-	mu.Lock()
-	out := globalCache.Metrics
-	if out == nil {
-		out = make([]*dto.MetricFamily, 0)
+	metrics := []*dto.MetricFamily{}
+	if time.Now().Sub(awsGroups.LastFetched) > opts.TTL {
+		logrus.Warnf("Last AWS metrics are older than TTL. Not exporting them.")
+	} else {
+		metrics = append(metrics, convertASGsToMetrics(awsGroups)...)
 	}
-	errFamily := errorCountMetrics(errorCounts)
+
+	errFamily := errorCountMetrics(errors)
 	if errFamily != nil {
-		out = append(out, errFamily)
+		metrics = append(metrics, errFamily)
 	}
-	if time.Now().Sub(globalCache.Date) > opts.TTL {
-		// Only serve stale data once. After that we delete it
-		logrus.Warnf("The metrics cache has expired. No asg metrics will be reported until it is refreshed")
-		globalCache.Metrics = make([]*dto.MetricFamily, 0)
-	}
-	mu.Unlock()
 
 	contentType := expfmt.Negotiate(req.Header)
 	header := rsp.Header()
@@ -314,7 +90,7 @@ func metricsHandler(rsp http.ResponseWriter, req *http.Request) {
 	enc := expfmt.NewEncoder(w, contentType)
 
 	var lastErr error
-	for _, mf := range out {
+	for _, mf := range metrics {
 		if err := enc.Encode(mf); err != nil {
 			lastErr = err
 			httpError(rsp, err)
