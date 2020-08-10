@@ -61,7 +61,7 @@ func NewClient(opts *AWSOps) *AWSClient {
 		}
 	}
 
-	svc := autoscaling.New(session.New())
+	svc := autoscaling.New(session.Must(session.NewSession()))
 	svc.Client.Retryer = client.DefaultRetryer{
 		NumMaxRetries:    9,
 		MinRetryDelay:    1 * time.Second,
